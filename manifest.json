@@ -1,0 +1,19 @@
+{
+  "name": "Ultra HD",
+  "version": "1.0.0",
+  "description": "Películas y series en Ultra HD (servidores latinos)",
+  "scrapers": [
+    {
+      "id": "ultrahd",
+      "name": "Ultra HD",
+      "description": "Películas y series en Ultra HD con varios servidores",
+      "version": "1.0.0",
+      "author": "",
+      "supportedTypes": ["movie", "tv"],
+      "filename": "providers/ultrahd.js",
+      "enabled": true,
+      "formats": ["mp4", "mkv", "m3u8"],
+      "contentLanguage": ["es"]
+    }
+  ]
+}
