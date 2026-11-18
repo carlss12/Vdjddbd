@@ -16,6 +16,13 @@ var DEBUG = true;
 var FLAG = "🇲🇽"; // 🇲🇽
 var TMDB_KEY = "2875f09178cac78e72ddcc7bf2154045";
 
+var SOLO_LATINO = true; // descarta títulos y categorías marcados como castellano, subtitulado, inglés o cámara
+// Hosts que se descartan siempre (sin puerto).
+var EXCLUDE_HOSTS = ["line.zen8kk.xyz", "ltv.ddns.net"];
+// Cuentas propias opcionales, por ejemplo { base: "http://host:8080", user: "usuario", pass: "clave" }.
+// Ojo: si el repo es público, esos datos los vería cualquiera.
+var EXTRA_ACCOUNTS = [];
+
 var BOOTSTRAP_URL = "http://vegetatvv2.duckdns.org/bootstrap.php";
 var VERSION_CODE = "21";
 var MAX_SERVERS = 24;
@@ -305,6 +312,13 @@ function buildContext(diag) {
     diag.flags = {};
     all.forEach(function (s) { var f = s.flag || "(sin bandera)"; diag.flags[f] = (diag.flags[f] || 0) + 1; });
     var mine = all.filter(function (s) { return s.flags.indexOf(FLAG) >= 0; });
+    var extra = EXTRA_ACCOUNTS.filter(function (a) { return a && a.base && a.user; }).map(function (a) {
+      return { base: a.base, host: getHost(a.base), user: a.user, pass: a.pass || "", flag: FLAG, flags: [FLAG], label: "propia" };
+    });
+    mine = extra.concat(mine);
+    var before = mine.length;
+    mine = mine.filter(function (s) { return EXCLUDE_HOSTS.indexOf(s.host.replace(/:\d+$/, "")) < 0; });
+    diag.excluded = before - mine.length;
     // quita duplicados exactos y ordena: HTTPS primero
     var seen = {}, uniq = [];
     mine.forEach(function (s) { var k = s.base + "|" + s.user; if (!seen[k]) { seen[k] = 1; uniq.push(s); } });
@@ -316,7 +330,7 @@ function buildContext(diag) {
       return api(srv, "get_vod_categories", null, T_SHORT).then(function (r) {
         if (!Array.isArray(r.data) || !r.data.length) throw new Error("sin categorías");
         return { srv: srv, pairs: pairHashes(r.data), ms: now() - t1, cats: r.data.map(function (c) { return { id: String(c.category_id), name: String(c.category_name || "") }; }) };
-      }).catch(function (e) { diag.dead.push(srv.host + ": " + errText(e)); return null; });
+      }).catch(function (e) { diag.dead.push(srv.host + ": " + errText(e) + (e && e.info ? " | " + e.info.slice(0, 120) : "")); return null; });
     }));
   }).then(function (rows) {
     var alive = rows.filter(Boolean);
@@ -344,27 +358,38 @@ function addRef(t, tm, ref) {
 }
 
 // Mapa: { ts, t: { tmdb: "id.ext,id.ext" }, n: [[clave,año,"id.ext"], ...], count, withTmdb, ... }
+var NONLATIN_RE = /[\(\[]\s*(?:CAST|CAS|ESP|SUB|SUBT|ENG|VOSE|CAM|HDCAM|TS|HDTS)\b\.?[^\)\]]*[\)\]]|\s[-\u2013]\s*(?:CAST|CAS|SUB|SUBT|ENG|VOSE)\.?\s*$|^\s*[|\u2503\u2502\u258E]\s*(?:ES|EN|SUB)\s*[|\u2503\u2502\u258E]/i;
+var POSTER_RE = /\/t\/p\/[^\/]+\/([A-Za-z0-9_-]+\.(?:jpg|jpeg|png))/i;
+
+// Mapa: { t: { tmdb: "id.ext,..." }, p: { archivoDePóster: "id.ext,..." }, n: [[clave,año,"id.ext"], ...], count, ... }
 function buildMap(items, isMovie) {
-  var t = {}, n = [], withTmdb = 0;
+  var t = {}, p = {}, n = [], withTmdb = 0, withPoster = 0;
   for (var i = 0; i < items.length; i++) {
     var it = items[i] || {};
     var id = String(isMovie ? it.stream_id : it.series_id || "");
     if (!id) continue;
+    var rawName = it.name || it.title || "";
+    if (SOLO_LATINO && NONLATIN_RE.test(rawName)) continue;
     var ext = isMovie ? String(it.container_extension || "mp4") : "";
     var ref = isMovie ? id + "." + ext : id;
     var tm = parseInt(it.tmdb || it.tmdb_id, 10) || 0;
-    if (tm > 0) { withTmdb++; addRef(t, tm, ref); }
-    else if (n.length < 60000) {
-      var c = cleanTitle(it.name || it.title, it.year || (it.release_date ? String(it.release_date).slice(0, 4) : ""));
+    if (tm > 0) { withTmdb++; addRef(t, tm, ref); continue; }
+    var pm = POSTER_RE.exec(String(it.stream_icon || it.cover || it.movie_image || ""));
+    if (pm) { withPoster++; addRef(p, pm[1], ref); }
+    if (n.length < 60000) {
+      var c = cleanTitle(rawName, it.year || (it.release_date ? String(it.release_date).slice(0, 4) : ""));
       var key = findKey(c.name);
       if (key) n.push([key, c.year, ref]);
     }
   }
-  return { ts: now(), t: t, n: n, count: items.length, withTmdb: withTmdb };
+  return { ts: now(), t: t, p: p, n: n, count: items.length, withTmdb: withTmdb, withPoster: withPoster };
 }
 
 function mergeInto(map, add) {
   for (var k in add.t) add.t[k].split(",").forEach(function (r) { addRef(map.t, k, r); });
+  if (!map.p) map.p = {};
+  for (var k2 in add.p) add.p[k2].split(",").forEach(function (r) { addRef(map.p, k2, r); });
+  map.withPoster = (map.withPoster || 0) + (add.withPoster || 0);
   if (map.n.length < 60000) map.n = map.n.concat(add.n.slice(0, 60000 - map.n.length));
   map.count += add.count;
   map.withTmdb += add.withTmdb;
@@ -394,16 +419,17 @@ function firstSuccess(factories, hedgeMs) {
 }
 
 var ADULT_RE = /xxx|adult|\+18|18\+|porn|sexo|er[oó]tic|hentai/i;
-var LATIN_RE = /lat|mex|espa|spanish|dual|castel/i;
+var LATIN_RE = /lat|mex|dual/i;
+var NONLATIN_CAT_RE = /castellano|subtitulad|\bcam\b|ingl[e\u00e9]s|english|espa[n\u00f1]a|spain/i;
 
 var FOREIGN_RE = /^\W*(ar|tr|nl|de|fr|it|pt|pl|ro|hr|al|in|pk|br|sa|ru|gr|se|no|dk|fi|cz|hu|bg|rs|ir|kr|jp|cn|th|vn|ex|ca|au|ie)\W|arab|turk|hindi|india|korea|german|franc|ital|portug|polsk|pakist|bangla|persa/i;
 function tier(name) { return LATIN_RE.test(name) ? 0 : FOREIGN_RE.test(name) ? 2 : 1; }
 
 function categoryIds(group, isMovie) {
   function clean(list) {
-    var ok = list.filter(function (c) { return !ADULT_RE.test(c.name); });
+    var ok = list.filter(function (c) { return !ADULT_RE.test(c.name) && !(SOLO_LATINO && NONLATIN_CAT_RE.test(c.name)); });
     ok.sort(function (a, b) { return tier(a.name) - tier(b.name); });
-    return ok.map(function (c) { return c.id; });
+    return ok;
   }
   if (isMovie) return Promise.resolve(clean(group.cats || []));
   var tries = group.members.slice(0, 3).map(function (srv) {
@@ -422,9 +448,9 @@ function scanCategories(group, isMovie, map, check, gd) {
   var action = isMovie ? "get_vod_streams" : "get_series";
   var deadline = now() + SCAN_BUDGET_MS;
   var rr = 0;
-  function one(catId) {
+  function one(cat) {
     var srv = group.members[rr++ % group.members.length];
-    return api(srv, action, { category_id: catId }, T_SHORT * 2).then(function (r) {
+    return api(srv, action, { category_id: cat.id }, T_SHORT * 2).then(function (r) {
       if (!Array.isArray(r.data)) throw new Error("lista inválida");
       if (r.partial) map.cutCats = (map.cutCats || 0) + 1;
       mergeInto(map, buildMap(r.data, isMovie));
@@ -472,7 +498,7 @@ function loadMap(group, isMovie, gd) {
     gd.mapFrom = "por categorías";
     return categoryIds(group, isMovie).then(function (ids) {
       if (!ids.length) throw new Error("sin categorías");
-      return { ts: now(), t: {}, n: [], count: 0, withTmdb: 0, partial: true, pending: ids.slice(), total: ids.length };
+      return { ts: now(), t: {}, p: {}, n: [], count: 0, withTmdb: 0, withPoster: 0, partial: true, pending: ids.slice(), total: ids.length };
     });
   }).then(function (map) {
     MEM.maps[key] = map;
@@ -485,6 +511,23 @@ function loadMap(group, isMovie, gd) {
 
 // ---------------------------------------------------------------- TMDB (respaldo por título)
 
+// Reordena lo que falta por revisar: primero el año (ESTRENOS 2026) y el género de la película.
+function prioritize(map, titles) {
+  if (!map.pending || map.pending.length < 2 || !titles) return;
+  var yr = titles.year ? String(titles.year) : "";
+  var gen = titles.genres || [];
+  function score(c) {
+    var k = findKey(c.name), sc = tier(c.name) * 10;
+    if (yr && k.indexOf(yr) >= 0) sc -= 6;
+    else if (titles.year && titles.year <= 1995 && k.indexOf("clasic") >= 0) sc -= 4;
+    for (var i = 0; i < gen.length; i++) if (k.indexOf(gen[i]) >= 0) { sc -= 3; break; }
+    return sc;
+  }
+  var scored = map.pending.map(function (c, i) { return { c: c, s: score(c), i: i }; });
+  scored.sort(function (a, b) { return a.s - b.s || a.i - b.i; });
+  map.pending = scored.map(function (x) { return x.c; });
+}
+
 function tmdbTitles(tmdbId, type) {
   if (!TMDB_KEY) return Promise.resolve(null);
   var kind = type === "movie" ? "movie" : "tv";
@@ -493,20 +536,33 @@ function tmdbTitles(tmdbId, type) {
       .then(function (r) { return r.data; }).catch(function () { return null; });
   }
   return Promise.all([one("es-MX"), one("en-US")]).then(function (arr) {
-    var names = {}, year = 0;
+    var names = {}, year = 0, posters = {}, genres = [];
     arr.forEach(function (d) {
       if (!d) return;
+      if (d.poster_path) posters[String(d.poster_path).replace(/^\//, "")] = 1;
+      (d.genres || []).forEach(function (g) {
+        var gk = findKey(g && g.name);
+        if (!gk) return;
+        if (genres.indexOf(gk) < 0) genres.push(gk);
+        gk.split(" y ").forEach(function (part) { if (part.length >= 4 && genres.indexOf(part) < 0) genres.push(part); });
+      });
       [d.title, d.name, d.original_title, d.original_name].forEach(function (x) { var k = findKey(x); if (k) names[k] = 1; });
       var date = d.release_date || d.first_air_date || "";
       if (!year && /^\d{4}/.test(date)) year = Number(date.slice(0, 4));
     });
-    return Object.keys(names).length ? { names: names, year: year } : null;
+    return Object.keys(names).length ? { names: names, year: year, posters: posters, genres: genres } : null;
   });
 }
 
 function findRefs(map, tmdbId, titles) {
   var hit = map.t[String(tmdbId)];
   if (hit) return { refs: hit.split(","), by: "tmdb" };
+  if (titles && titles.posters && map.p) {
+    for (var pk in titles.posters) {
+      var ph = map.p[pk];
+      if (ph) return { refs: ph.split(","), by: "póster" };
+    }
+  }
   if (titles && map.n && map.n.length) {
     var out = [];
     for (var i = 0; i < map.n.length; i++) {
@@ -572,7 +628,7 @@ function buildDiagCards(diag, groupsDiag) {
     "contexto: " + diag.ctxFrom + (diag.bootMs ? " (" + diag.bootMs + "ms)" : ""),
     "líneas: " + (diag.total === undefined ? "(no se pidió esta vez)" : diag.total),
     "banderas: " + (diag.flags ? Object.keys(diag.flags).map(function (k) { return k + " " + diag.flags[k]; }).join(", ") : "-"),
-    "MX: " + (diag.mx === undefined ? "-" : diag.mx) + " | vivas: " + (diag.alive === undefined ? "-" : diag.alive),
+    "MX: " + (diag.mx === undefined ? "-" : diag.mx) + (diag.excluded ? " (+" + diag.excluded + " excluidas)" : "") + " | vivas: " + (diag.alive === undefined ? "-" : diag.alive),
     "almacenamiento: " + (st ? st.kind : "no hay (solo memoria)")
   ];
   var out = [diagCard("ℹ️ Resumen", head)];
@@ -580,7 +636,7 @@ function buildDiagCards(diag, groupsDiag) {
   groupsDiag.forEach(function (g) {
     var lines = [
       g.hosts.join(", "),
-      "lista: " + (g.mapFrom || "-") + (g.count !== undefined ? " | " + g.count + " títulos, " + g.withTmdb + " con tmdb" : ""),
+      "lista: " + (g.mapFrom || "-") + (g.count !== undefined ? " | " + g.count + " títulos, " + g.withTmdb + " con tmdb" + (g.withPoster ? ", " + g.withPoster + " con póster" : "") : ""),
       (g.listMs ? "bajada: " + g.listMs + "ms, " + g.listKB + " KB | " : "") + "total " + (g.ms || 0) + "ms"
     ];
     if (g.listErr) lines.push("lista completa falló: " + g.listErr);
@@ -597,9 +653,10 @@ function lookup(group, isMovie, tmdbId, titlesP, gd) {
   return Promise.all([loadMap(group, isMovie, gd), titlesP]).then(function (arr) {
     var map = arr[0], titles = arr[1];
     var check = function () { return findRefs(map, tmdbId, titles).refs.length > 0; };
+    if (!check() && map.partial) prioritize(map, titles);
     var more = (!check() && map.partial && map.pending && map.pending.length) ? scanMore(group, isMovie, map, check, gd) : Promise.resolve();
     return more.then(function () {
-      gd.count = map.count; gd.withTmdb = map.withTmdb; gd.listMs = map.ms; gd.listKB = map.bytes ? Math.round(map.bytes / 1024) : 0;
+      gd.count = map.count; gd.withTmdb = map.withTmdb; gd.withPoster = map.withPoster || 0; gd.listMs = map.ms; gd.listKB = map.bytes ? Math.round(map.bytes / 1024) : 0;
       if (map.partial) { gd.total = map.total; gd.scanned = map.total - map.pending.length; gd.catErrors = map.catErrors || 0; gd.cut = map.cutCats || 0; }
       return findRefs(map, tmdbId, titles);
     });
