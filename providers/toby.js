@@ -14,15 +14,15 @@
 
 var DEBUG = true;
 var FLAG = "🇲🇽"; // 🇲🇽
-var TMDB_KEY = ""; // pegar la misma clave de los otros plugins (123.js / animejara.js)
+var TMDB_KEY = "2875f09178cac78e72ddcc7bf2154045";
 
 var BOOTSTRAP_URL = "http://vegetatvv2.duckdns.org/bootstrap.php";
 var VERSION_CODE = "21";
 var MAX_SERVERS = 24;
 var T_SHORT = 8000;    // categorías / pruebas
-var SCAN_BUDGET_MS = 30000; // tope por búsqueda al recorrer categorías
-var SCAN_CONC = 6;          // categorías pedidas a la vez
-var T_LIST = 25000;    // lista completa de películas o series
+var SCAN_BUDGET_MS = 35000; // tope por búsqueda al recorrer categorías
+var SCAN_CONC = 10;         // categorías pedidas a la vez
+var T_LIST = 15000;    // lista completa de películas o series
 var HEDGE_MS = 8000;   // si la primera cuenta tarda, se lanza la siguiente del panel
 var TTL_MS = 6 * 60 * 60 * 1000;
 var MIN_SHARED = 8, MIN_SHARE = 0.8; // regla para decidir si dos cuentas son del mismo panel
@@ -56,13 +56,29 @@ function fetchText(url, headers, ms, label) {
   return withTimeout(p, ms, label);
 }
 
+// Si la respuesta llega cortada (tope de ~1 MB), se recorta hasta el último elemento completo.
+function salvageArray(text) {
+  var pos = text.length;
+  for (var i = 0; i < 6; i++) {
+    pos = text.lastIndexOf("},{", pos - 1);
+    if (pos < 0) return null;
+    try { var a = JSON.parse(text.slice(0, pos + 1) + "]"); if (Array.isArray(a)) return a; } catch (e) {}
+  }
+  return null;
+}
+
 function fetchJson(url, headers, ms, label) {
   return fetchText(url, headers, ms, label).then(function (r) {
     var info = "HTTP " + r.status + " | " + (r.ct || "?") + " | " + r.text.length + " bytes | «" + r.text.slice(0, 100).replace(/\s+/g, " ") + "»";
     if (!r.ok) { var e1 = new Error("HTTP " + r.status); e1.info = info; throw e1; }
     var data;
-    try { data = JSON.parse(r.text); } catch (e) { var e2 = new Error("respuesta no JSON"); e2.info = info; throw e2; }
-    return { data: data, bytes: r.text.length };
+    var partial = false;
+    try { data = JSON.parse(r.text); } catch (e) {
+      data = r.text.charAt(0) === "[" ? salvageArray(r.text) : null;
+      if (!data) { var e2 = new Error("respuesta no JSON"); e2.info = info; throw e2; }
+      partial = true;
+    }
+    return { data: data, bytes: r.text.length, partial: partial };
   });
 }
 
@@ -91,11 +107,13 @@ function cleanTitle(raw, yearField) {
   var year = 0;
   for (var i = 0; i < 6; i++) {
     var before = name;
-    name = name.replace(/^\s*\|[^|]{1,24}\|\s*/, "")
+    name = name.replace(/^\s*[|\u2503\u2502\u258E][^|\u2503\u2502\u258E]{1,24}[|\u2503\u2502\u258E]\s*/, "")
+      .replace(/^\s*[A-Z]{2,5}\s*[\u2503\u2502\u258E]\s*/, "")
       .replace(/\s*\[[^\]]*\]\s*$/, "")
-      .replace(/\s*\(\s*(LAT|CAST|ENG|SUB|DUAL|4K|UHD|FHD|HD)\s*\)\s*$/i, "");
-    var y = /\s*\(\s*((?:19|20)\d\d)\s*\)\s*$/.exec(name);
-    if (y) { if (!year) year = Number(y[1]); name = name.slice(0, y.index); }
+      .replace(/\s*\(\s*(LAT|LATINO|CAST|CAS|ESP|ENG|SUB|DUAL|MULTI|4K|UHD|FHD|HD)\.?\s*\)\s*$/i, "")
+      .replace(/\s+[-\u2013]\s*(LAT|LATINO|CAST|CAS|ESP|ENG|SUB|DUAL|MULTI|4K)\.?\s*$/i, "");
+    var y = /\s*(?:\(\s*((?:19|20)\d\d)\s*\)|[-\u2013]\s*((?:19|20)\d\d))\s*$/.exec(name);
+    if (y) { if (!year) year = Number(y[1] || y[2]); name = name.slice(0, y.index); }
     if (name === before) break;
   }
   if (/^(19|20)\d\d$/.test(String(yearField || "").trim())) year = Number(String(yearField).trim());
@@ -378,10 +396,13 @@ function firstSuccess(factories, hedgeMs) {
 var ADULT_RE = /xxx|adult|\+18|18\+|porn|sexo|er[oó]tic|hentai/i;
 var LATIN_RE = /lat|mex|espa|spanish|dual|castel/i;
 
+var FOREIGN_RE = /^\W*(ar|tr|nl|de|fr|it|pt|pl|ro|hr|al|in|pk|br|sa|ru|gr|se|no|dk|fi|cz|hu|bg|rs|ir|kr|jp|cn|th|vn|ex|ca|au|ie)\W|arab|turk|hindi|india|korea|german|franc|ital|portug|polsk|pakist|bangla|persa/i;
+function tier(name) { return LATIN_RE.test(name) ? 0 : FOREIGN_RE.test(name) ? 2 : 1; }
+
 function categoryIds(group, isMovie) {
   function clean(list) {
     var ok = list.filter(function (c) { return !ADULT_RE.test(c.name); });
-    ok.sort(function (a, b) { return (LATIN_RE.test(b.name) ? 1 : 0) - (LATIN_RE.test(a.name) ? 1 : 0); });
+    ok.sort(function (a, b) { return tier(a.name) - tier(b.name); });
     return ok.map(function (c) { return c.id; });
   }
   if (isMovie) return Promise.resolve(clean(group.cats || []));
@@ -397,7 +418,7 @@ function categoryIds(group, isMovie) {
 }
 
 // Si el panel no entrega la lista completa se recorre por categorías (varias a la vez) hasta encontrar lo que se busca.
-function scanCategories(group, isMovie, map, wantTmdb, gd) {
+function scanCategories(group, isMovie, map, check, gd) {
   var action = isMovie ? "get_vod_streams" : "get_series";
   var deadline = now() + SCAN_BUDGET_MS;
   var rr = 0;
@@ -405,6 +426,7 @@ function scanCategories(group, isMovie, map, wantTmdb, gd) {
     var srv = group.members[rr++ % group.members.length];
     return api(srv, action, { category_id: catId }, T_SHORT * 2).then(function (r) {
       if (!Array.isArray(r.data)) throw new Error("lista inválida");
+      if (r.partial) map.cutCats = (map.cutCats || 0) + 1;
       mergeInto(map, buildMap(r.data, isMovie));
     }).catch(function (e) {
       map.catErrors = (map.catErrors || 0) + 1;
@@ -412,16 +434,16 @@ function scanCategories(group, isMovie, map, wantTmdb, gd) {
     });
   }
   function loop() {
-    if (!map.pending.length || now() > deadline || (wantTmdb && map.t[String(wantTmdb)])) return Promise.resolve();
+    if (!map.pending.length || now() > deadline || (check && check())) return Promise.resolve();
     var batch = map.pending.splice(0, SCAN_CONC);
     return Promise.all(batch.map(one)).then(loop);
   }
   return loop();
 }
 
-function scanMore(group, isMovie, map, wantTmdb, gd) {
+function scanMore(group, isMovie, map, check, gd) {
   if (!map.scanning) {
-    map.scanning = scanCategories(group, isMovie, map, wantTmdb, gd).then(function () { map.scanning = null; }, function () { map.scanning = null; });
+    map.scanning = scanCategories(group, isMovie, map, check, gd).then(function () { map.scanning = null; }, function () { map.scanning = null; });
   }
   return map.scanning;
 }
@@ -436,6 +458,7 @@ function loadMap(group, isMovie, gd) {
     return function () {
       var t0 = now();
       return api(srv, action, null, T_LIST).then(function (r) {
+        if (r.partial) { var ep = new Error("lista cortada"); ep.info = "cortada a " + r.bytes + " bytes (tope de ~1 MB)"; throw ep; }
         if (!Array.isArray(r.data)) throw new Error("lista inválida");
         var map = buildMap(r.data, isMovie);
         map.ms = now() - t0; map.bytes = r.bytes; map.host = srv.host;
@@ -562,6 +585,7 @@ function buildDiagCards(diag, groupsDiag) {
     ];
     if (g.listErr) lines.push("lista completa falló: " + g.listErr);
     if (g.total !== undefined) lines.push("categorías revisadas: " + g.scanned + "/" + g.total + (g.catErrors ? " (" + g.catErrors + " con error)" : ""));
+    if (g.cut) lines.push("categorías cortadas a 1 MB: " + g.cut + " (se usó lo que llegó)");
     if (g.scanErr) lines.push("error de categoría: " + g.scanErr);
     lines.push("resultado: " + g.result + (g.epErr ? " (" + g.epErr + ")" : ""));
     out.push(diagCard("🧩 Panel " + g.n + " (" + g.hosts.length + " cuentas)", lines));
@@ -569,18 +593,15 @@ function buildDiagCards(diag, groupsDiag) {
   return out;
 }
 
-function lookup(group, isMovie, tmdbId, wantTitles, gd) {
-  return loadMap(group, isMovie, gd).then(function (map) {
-    var found = findRefs(map, tmdbId, null);
-    var more = (!found.refs.length && map.partial && map.pending && map.pending.length) ? scanMore(group, isMovie, map, tmdbId, gd) : Promise.resolve();
+function lookup(group, isMovie, tmdbId, titlesP, gd) {
+  return Promise.all([loadMap(group, isMovie, gd), titlesP]).then(function (arr) {
+    var map = arr[0], titles = arr[1];
+    var check = function () { return findRefs(map, tmdbId, titles).refs.length > 0; };
+    var more = (!check() && map.partial && map.pending && map.pending.length) ? scanMore(group, isMovie, map, check, gd) : Promise.resolve();
     return more.then(function () {
-      found = findRefs(map, tmdbId, null);
       gd.count = map.count; gd.withTmdb = map.withTmdb; gd.listMs = map.ms; gd.listKB = map.bytes ? Math.round(map.bytes / 1024) : 0;
-      if (map.partial) { gd.total = map.total; gd.scanned = map.total - map.pending.length; gd.catErrors = map.catErrors || 0; }
-      if (!found.refs.length && map.n && map.n.length && TMDB_KEY) {
-        return wantTitles().then(function (titles) { return findRefs(map, tmdbId, titles); });
-      }
-      return found;
+      if (map.partial) { gd.total = map.total; gd.scanned = map.total - map.pending.length; gd.catErrors = map.catErrors || 0; gd.cut = map.cutCats || 0; }
+      return findRefs(map, tmdbId, titles);
     });
   });
 }
@@ -591,15 +612,14 @@ exports.getStreams = function (tmdbId, type, season, episode) {
   var diag = { dead: [], ctxFrom: "" };
   var groupsDiag = [];
   var cards = [];
+  var titlesP = tmdbTitles(tmdbId, type).catch(function () { return null; });
   return loadContext(diag).then(function (ctx) {
     if (!ctx.groups.length) return;
-    var titlesP = null;
-    var wantTitles = function () { if (!titlesP) titlesP = tmdbTitles(tmdbId, type); return titlesP; };
     return Promise.all(ctx.groups.map(function (group, gi) {
       var gd = { n: gi + 1, hosts: group.members.map(function (m) { return m.host; }), result: "" };
       groupsDiag.push(gd);
       var t0 = now();
-      return lookup(group, isMovie, tmdbId, wantTitles, gd).then(function (found) {
+      return lookup(group, isMovie, tmdbId, titlesP, gd).then(function (found) {
         if (!found.refs.length) { gd.result = "no está en este panel"; return; }
         gd.result = "encontrada por " + found.by + " (" + found.refs.length + ")";
         if (isMovie) {
@@ -622,7 +642,7 @@ exports.getStreams = function (tmdbId, type, season, episode) {
     if (DEBUG) {
       var d = buildDiagCards(diag, groupsDiag);
       if (diag.fatal) d.unshift(diagCard("⚠ Error", [diag.fatal]));
-      result = d.concat(cards);
+      result = cards.concat(d);
     }
     return result;
   }).catch(function () { return []; });
