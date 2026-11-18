@@ -1,13 +1,13 @@
 {
   "name": "Toby",
-  "version": "1.1",
+  "version": "1.2",
   "description": "Películas y series con varios servidores",
   "scrapers": [
     {
       "id": "toby",
       "name": "Toby",
       "description": "Películas y series con varios servidores",
-      "version": "1.1",
+      "version": "1.2",
       "author": "",
       "supportedTypes": ["movie", "tv"],
       "filename": "providers/toby.js",
