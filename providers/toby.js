@@ -31,7 +31,12 @@ var SCAN_BUDGET_MS = 35000; // tope por búsqueda al recorrer categorías
 var SCAN_CONC = 10;         // categorías pedidas a la vez
 var T_LIST = 15000;    // lista completa de películas o series
 var HEDGE_MS = 8000;   // si la primera cuenta tarda, se lanza la siguiente del panel
-var TTL_MS = 6 * 60 * 60 * 1000;
+var TTL_MS = 6 * 60 * 60 * 1000;        // listas ya revisadas de cada panel
+var CTX_TTL_MS = 60 * 60 * 1000;        // cuentas vivas/caídas: se revisan de nuevo cada hora
+var CTX_RETRY_MS = 3 * 60 * 1000;       // si alguna cuenta falló por tiempo, se reintenta pronto
+var T_PROBE = 5000;                     // espera máxima al probar una cuenta
+var OVERALL_MS = 25000;                 // tope total antes de entregar lo que haya
+var MAX_REFS = 6;                       // copias por película (tmdb o póster)
 var MIN_SHARED = 8, MIN_SHARE = 0.8; // regla para decidir si dos cuentas son del mismo panel
 var MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; moto g82 5G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Mobile Safari/537.36";
 var DIAG_URL = "http://127.0.0.1/diagnostico";
@@ -118,7 +123,8 @@ function cleanTitle(raw, yearField) {
       .replace(/^\s*[A-Z]{2,5}\s*[\u2503\u2502\u258E]\s*/, "")
       .replace(/\s*\[[^\]]*\]\s*$/, "")
       .replace(/\s*\(\s*(LAT|LATINO|CAST|CAS|ESP|ENG|SUB|DUAL|MULTI|4K|UHD|FHD|HD)\.?\s*\)\s*$/i, "")
-      .replace(/\s+[-\u2013]\s*(LAT|LATINO|CAST|CAS|ESP|ENG|SUB|DUAL|MULTI|4K)\.?\s*$/i, "");
+      .replace(/\s+[-\u2013]\s*(LAT|LATINO|CAST|CAS|ESP|ENG|SUB|DUAL|MULTI|4K)\.?\s*$/i, "")
+      .replace(/\s+(?:4K|UHD|2160p|1080p|720p|FHD)\s*$/i, "");
     var y = /\s*(?:\(\s*((?:19|20)\d\d)\s*\)|[-\u2013]\s*((?:19|20)\d\d))\s*$/.exec(name);
     if (y) { if (!year) year = Number(y[1] || y[2]); name = name.slice(0, y.index); }
     if (name === before) break;
@@ -293,7 +299,7 @@ function groupByPanel(items) {
 // ---------------------------------------------------------------- contexto (cuentas vivas + paneles)
 
 function loadContext(diag) {
-  if (MEM.ctx && now() - MEM.ctx.ts < TTL_MS) { diag.ctxFrom = "memoria"; return Promise.resolve(MEM.ctx); }
+  if (MEM.ctx && now() - MEM.ctx.ts < (MEM.ctx.retry ? CTX_RETRY_MS : CTX_TTL_MS)) { diag.ctxFrom = "memoria"; return Promise.resolve(MEM.ctx); }
   if (MEM.inflight.ctx) return MEM.inflight.ctx;
   var p = storeGet("toby:ctx:v1").then(function (saved) {
     if (saved && saved.groups && saved.groups.length) { diag.ctxFrom = "almacenamiento"; MEM.ctx = saved; return saved; }
@@ -305,6 +311,7 @@ function loadContext(diag) {
 
 function buildContext(diag) {
   diag.ctxFrom = "bootstrap";
+  var timeouts = 0;
   var t0 = now();
   return fetchBootstrap().then(function (all) {
     diag.bootMs = now() - t0;
@@ -327,10 +334,14 @@ function buildContext(diag) {
     diag.mx = uniq.length;
     return Promise.all(uniq.map(function (srv) {
       var t1 = now();
-      return api(srv, "get_vod_categories", null, T_SHORT).then(function (r) {
+      return api(srv, "get_vod_categories", null, T_PROBE).then(function (r) {
         if (!Array.isArray(r.data) || !r.data.length) throw new Error("sin categorías");
         return { srv: srv, pairs: pairHashes(r.data), ms: now() - t1, cats: r.data.map(function (c) { return { id: String(c.category_id), name: String(c.category_name || "") }; }) };
-      }).catch(function (e) { diag.dead.push(srv.host + ": " + errText(e) + (e && e.info ? " | " + e.info.slice(0, 120) : "")); return null; });
+      }).catch(function (e) {
+        if (/tiempo agotado/.test(errText(e))) { timeouts++; diag.dead.push(srv.host + ": tiempo agotado (se reintenta pronto)"); }
+        else diag.dead.push(srv.host + ": " + errText(e) + (e && e.info ? " | " + e.info.slice(0, 120) : ""));
+        return null;
+      });
     }));
   }).then(function (rows) {
     var alive = rows.filter(Boolean);
@@ -338,6 +349,7 @@ function buildContext(diag) {
     var groups = groupByPanel(alive);
     var ctx = {
       ts: now(),
+      retry: timeouts > 0,
       groups: groups.map(function (g) {
         return { id: djb2(g.members[0].base + "|" + g.members[0].user), members: g.members, cats: g.cats };
       })
@@ -354,16 +366,29 @@ function addRef(t, tm, ref) {
   var cur = t[tm];
   if (!cur) { t[tm] = ref; return; }
   var arr = cur.split(",");
-  if (arr.length < 3 && arr.indexOf(ref) < 0) t[tm] = cur + "," + ref;
+  if (arr.length < MAX_REFS && arr.indexOf(ref) < 0) t[tm] = cur + "," + ref;
 }
 
 // Mapa: { ts, t: { tmdb: "id.ext,id.ext" }, n: [[clave,año,"id.ext"], ...], count, withTmdb, ... }
-var NONLATIN_RE = /[\(\[]\s*(?:CAST|CAS|ESP|SUB|SUBT|ENG|VOSE|CAM|HDCAM|TS|HDTS)\b\.?[^\)\]]*[\)\]]|\s[-\u2013]\s*(?:CAST|CAS|SUB|SUBT|ENG|VOSE)\.?\s*$|^\s*[|\u2503\u2502\u258E]\s*(?:ES|EN|SUB)\s*[|\u2503\u2502\u258E]/i;
+var NONLATIN_RE = /[\(\[]\s*(?:CAST|CAS|ESP|SUB|SUBT|ENG|VOSE|CAM|HDCAM|TS|HDTS)\b\.?[^\)\]]*[\)\]]|\s[-–]\s*(?:CAST|CAS|SUB|SUBT|ENG|VOSE)\.?\s*$|^\s*[|┃│▎]\s*(?:ES|EN|SUB)\s*[|┃│▎]/i;
 var POSTER_RE = /\/t\/p\/[^\/]+\/([A-Za-z0-9_-]+\.(?:jpg|jpeg|png))/i;
+var QUALITY_RE = /(?:^|[\s(\[\-|])(4K|UHD|2160p|FHD|1080p|720p|HD)(?=$|[\s)\]\.\-|])/i;
 
-// Mapa: { t: { tmdb: "id.ext,..." }, p: { archivoDePóster: "id.ext,..." }, n: [[clave,año,"id.ext"], ...], count, ... }
-function buildMap(items, isMovie) {
-  var t = {}, p = {}, n = [], withTmdb = 0, withPoster = 0;
+// Calidad solo si el propio nombre (o su categoría) la dice; si no, no se escribe nada.
+function qualityOf(name) {
+  var m = QUALITY_RE.exec(String(name || ""));
+  if (!m) return "";
+  var v = m[1].toUpperCase();
+  if (v === "UHD" || v === "2160P") return "4K";
+  if (v === "1080P") return "1080p";
+  if (v === "720P") return "720p";
+  return v;
+}
+function catQuality(catName) { return /4k|uhd|2160/i.test(String(catName || "")) ? "4K" : ""; }
+
+// Mapa: { t: { tmdb: "id.ext,..." }, p: { archivoDePóster: "id.ext,..." }, q: { "id.ext": calidad }, n: [[clave,año,"id.ext"], ...], ... }
+function buildMap(items, isMovie, catQ) {
+  var t = {}, p = {}, q = {}, n = [], withTmdb = 0, withPoster = 0;
   for (var i = 0; i < items.length; i++) {
     var it = items[i] || {};
     var id = String(isMovie ? it.stream_id : it.series_id || "");
@@ -372,6 +397,8 @@ function buildMap(items, isMovie) {
     if (SOLO_LATINO && NONLATIN_RE.test(rawName)) continue;
     var ext = isMovie ? String(it.container_extension || "mp4") : "";
     var ref = isMovie ? id + "." + ext : id;
+    var quality = qualityOf(rawName) || catQ || "";
+    if (quality) q[ref] = quality;
     var tm = parseInt(it.tmdb || it.tmdb_id, 10) || 0;
     if (tm > 0) { withTmdb++; addRef(t, tm, ref); continue; }
     var pm = POSTER_RE.exec(String(it.stream_icon || it.cover || it.movie_image || ""));
@@ -382,13 +409,15 @@ function buildMap(items, isMovie) {
       if (key) n.push([key, c.year, ref]);
     }
   }
-  return { ts: now(), t: t, p: p, n: n, count: items.length, withTmdb: withTmdb, withPoster: withPoster };
+  return { ts: now(), t: t, p: p, q: q, n: n, count: items.length, withTmdb: withTmdb, withPoster: withPoster };
 }
 
 function mergeInto(map, add) {
   for (var k in add.t) add.t[k].split(",").forEach(function (r) { addRef(map.t, k, r); });
   if (!map.p) map.p = {};
   for (var k2 in add.p) add.p[k2].split(",").forEach(function (r) { addRef(map.p, k2, r); });
+  if (!map.q) map.q = {};
+  for (var k3 in add.q) map.q[k3] = add.q[k3];
   map.withPoster = (map.withPoster || 0) + (add.withPoster || 0);
   if (map.n.length < 60000) map.n = map.n.concat(add.n.slice(0, 60000 - map.n.length));
   map.count += add.count;
@@ -444,25 +473,29 @@ function categoryIds(group, isMovie) {
 }
 
 // Si el panel no entrega la lista completa se recorre por categorías (varias a la vez) hasta encontrar lo que se busca.
-function scanCategories(group, isMovie, map, check, gd) {
+function fetchCategory(group, isMovie, map, cat, gd) {
   var action = isMovie ? "get_vod_streams" : "get_series";
+  map.rr = (map.rr || 0) + 1;
+  var srv = group.members[map.rr % group.members.length];
+  return api(srv, action, { category_id: cat.id }, T_SHORT * 2).then(function (r) {
+    if (!Array.isArray(r.data)) throw new Error("lista inválida");
+    if (r.partial) map.cutCats = (map.cutCats || 0) + 1;
+    mergeInto(map, buildMap(r.data, isMovie, catQuality(cat.name)));
+  }).catch(function (e) {
+    cat.tries = (cat.tries || 0) + 1;
+    if (cat.tries < 2) { map.pending.push(cat); return; } // se reintenta una vez, al final
+    map.catErrors = (map.catErrors || 0) + 1;
+    if (!gd.scanErr) gd.scanErr = e.info || errText(e);
+  });
+}
+
+// Pide categorías (varias a la vez) hasta que [check] diga que ya se encontró lo buscado o se acabe el tiempo.
+function scanCategories(group, isMovie, map, check, gd) {
   var deadline = now() + SCAN_BUDGET_MS;
-  var rr = 0;
-  function one(cat) {
-    var srv = group.members[rr++ % group.members.length];
-    return api(srv, action, { category_id: cat.id }, T_SHORT * 2).then(function (r) {
-      if (!Array.isArray(r.data)) throw new Error("lista inválida");
-      if (r.partial) map.cutCats = (map.cutCats || 0) + 1;
-      mergeInto(map, buildMap(r.data, isMovie));
-    }).catch(function (e) {
-      map.catErrors = (map.catErrors || 0) + 1;
-      if (!gd.scanErr) gd.scanErr = e.info || errText(e);
-    });
-  }
   function loop() {
     if (!map.pending.length || now() > deadline || (check && check())) return Promise.resolve();
     var batch = map.pending.splice(0, SCAN_CONC);
-    return Promise.all(batch.map(one)).then(loop);
+    return Promise.all(batch.map(function (c) { return fetchCategory(group, isMovie, map, c, gd); })).then(loop);
   }
   return loop();
 }
@@ -474,33 +507,30 @@ function scanMore(group, isMovie, map, check, gd) {
   return map.scanning;
 }
 
+// Con la película ya encontrada, se busca su copia 4K yendo directo a la(s) categoría(s) 4K del panel (si tiene).
+function fourKStep(group, isMovie, map, gd) {
+  if (map.fourKDone) return Promise.resolve();
+  var cats = (map.pending || []).filter(function (c) { return catQuality(c.name) === "4K"; });
+  map.fourKDone = true;
+  if (!cats.length) { gd.fourK = map.has4K ? "categoría 4K ya revisada" : "el panel no tiene categoría 4K"; return Promise.resolve(); }
+  map.pending = map.pending.filter(function (c) { return catQuality(c.name) !== "4K"; });
+  gd.fourK = "categoría 4K revisada (" + cats.length + ")";
+  return Promise.all(cats.map(function (c) { return fetchCategory(group, isMovie, map, c, gd); }));
+}
+
 function loadMap(group, isMovie, gd) {
   var key = "toby:map:" + (isMovie ? "m" : "s") + ":" + group.id;
   var mem = MEM.maps[key];
-  if (mem && now() - mem.ts < TTL_MS) { gd.mapFrom = mem.partial ? "memoria (por categorías)" : "memoria"; return Promise.resolve(mem); }
+  if (mem && now() - mem.ts < TTL_MS) { gd.mapFrom = "memoria"; return Promise.resolve(mem); }
   if (MEM.inflight[key]) { gd.mapFrom = "en curso"; return MEM.inflight[key]; }
-  var action = isMovie ? "get_vod_streams" : "get_series";
-  var tries = group.members.slice(0, 3).map(function (srv) {
-    return function () {
-      var t0 = now();
-      return api(srv, action, null, T_LIST).then(function (r) {
-        if (r.partial) { var ep = new Error("lista cortada"); ep.info = "cortada a " + r.bytes + " bytes (tope de ~1 MB)"; throw ep; }
-        if (!Array.isArray(r.data)) throw new Error("lista inválida");
-        var map = buildMap(r.data, isMovie);
-        map.ms = now() - t0; map.bytes = r.bytes; map.host = srv.host;
-        return map;
-      });
+  gd.mapFrom = "por categorías";
+  var p = categoryIds(group, isMovie).then(function (cats) {
+    if (!cats.length) throw new Error("sin categorías");
+    var map = {
+      ts: now(), t: {}, p: {}, q: {}, n: [], count: 0, withTmdb: 0, withPoster: 0, partial: true,
+      pending: cats.slice(), total: cats.length,
+      has4K: cats.some(function (c) { return catQuality(c.name) === "4K"; })
     };
-  });
-  gd.mapFrom = "servidor";
-  var p = firstSuccess(tries, HEDGE_MS).catch(function (e) {
-    gd.listErr = e.info || errText(e);
-    gd.mapFrom = "por categorías";
-    return categoryIds(group, isMovie).then(function (ids) {
-      if (!ids.length) throw new Error("sin categorías");
-      return { ts: now(), t: {}, p: {}, n: [], count: 0, withTmdb: 0, withPoster: 0, partial: true, pending: ids.slice(), total: ids.length };
-    });
-  }).then(function (map) {
     MEM.maps[key] = map;
     MEM.inflight[key] = null;
     return map;
@@ -602,18 +632,27 @@ function findEpisode(group, seriesId, season, episode, gdiag) {
 
 // ---------------------------------------------------------------- tarjetas
 
-function card(srv, path, ext) {
-  var isHls = ext === "m3u8";
-  var fmt = isHls ? "HLS" : String(ext || "mp4").toUpperCase();
-  var s = {
-    name: "Toby",
-    title: "",
-    url: srv.base + path,
-    quality: "📺 Toby · " + srv.host + " (" + fmt + ")\nHD | WEB-DL\n🇲🇽 LATINO",
-    headers: { "User-Agent": MOBILE_UA }
-  };
-  if (isHls) s.type = "hls";
-  return s;
+// Arma las tarjetas: sin repetidos exactos; calidad solo si se sabe; con DEBUG apagado solo "Opción N".
+function makeCards(entries) {
+  var seen = {}, list = [];
+  entries.forEach(function (e) { var u = e.srv.base + e.path; if (!seen[u]) { seen[u] = 1; list.push(e); } });
+  var perHost = {}, seqHost = {};
+  list.forEach(function (e) { perHost[e.srv.host] = (perHost[e.srv.host] || 0) + 1; });
+  return list.map(function (e, i) {
+    var label;
+    if (DEBUG) {
+      seqHost[e.srv.host] = (seqHost[e.srv.host] || 0) + 1;
+      label = e.srv.host + (perHost[e.srv.host] > 1 ? " · opción " + seqHost[e.srv.host] : "");
+    } else label = "Opción " + (i + 1);
+    var isHls = e.ext === "m3u8";
+    var fmt = isHls ? "HLS" : String(e.ext || "mp4").toUpperCase();
+    var lines = ["📺 Toby · " + label + " (" + fmt + ")"];
+    if (e.q) lines.push(e.q);
+    lines.push("🇲🇽 LATINO");
+    var s = { name: "Toby", title: "", url: e.srv.base + e.path, quality: lines.join("\n"), headers: { "User-Agent": MOBILE_UA } };
+    if (isHls) s.type = "hls";
+    return s;
+  });
 }
 
 function diagCard(title, lines) {
@@ -642,8 +681,9 @@ function buildDiagCards(diag, groupsDiag) {
     if (g.listErr) lines.push("lista completa falló: " + g.listErr);
     if (g.total !== undefined) lines.push("categorías revisadas: " + g.scanned + "/" + g.total + (g.catErrors ? " (" + g.catErrors + " con error)" : ""));
     if (g.cut) lines.push("categorías cortadas a 1 MB: " + g.cut + " (se usó lo que llegó)");
+    if (g.fourK) lines.push("4K: " + g.fourK);
     if (g.scanErr) lines.push("error de categoría: " + g.scanErr);
-    lines.push("resultado: " + g.result + (g.epErr ? " (" + g.epErr + ")" : ""));
+    lines.push("resultado: " + (g.result || "sigue buscando en segundo plano") + (g.epErr ? " (" + g.epErr + ")" : ""));
     out.push(diagCard("🧩 Panel " + g.n + " (" + g.hosts.length + " cuentas)", lines));
   });
   return out;
@@ -656,9 +696,13 @@ function lookup(group, isMovie, tmdbId, titlesP, gd) {
     if (!check() && map.partial) prioritize(map, titles);
     var more = (!check() && map.partial && map.pending && map.pending.length) ? scanMore(group, isMovie, map, check, gd) : Promise.resolve();
     return more.then(function () {
-      gd.count = map.count; gd.withTmdb = map.withTmdb; gd.withPoster = map.withPoster || 0; gd.listMs = map.ms; gd.listKB = map.bytes ? Math.round(map.bytes / 1024) : 0;
+      if (check() && map.partial) return fourKStep(group, isMovie, map, gd);
+    }).then(function () {
+      gd.count = map.count; gd.withTmdb = map.withTmdb; gd.withPoster = map.withPoster || 0;
       if (map.partial) { gd.total = map.total; gd.scanned = map.total - map.pending.length; gd.catErrors = map.catErrors || 0; gd.cut = map.cutCats || 0; }
-      return findRefs(map, tmdbId, titles);
+      var found = findRefs(map, tmdbId, titles);
+      found.q = map.q || {};
+      return found;
     });
   });
 }
@@ -668,38 +712,48 @@ exports.getStreams = function (tmdbId, type, season, episode) {
   var isMovie = type === "movie";
   var diag = { dead: [], ctxFrom: "" };
   var groupsDiag = [];
-  var cards = [];
+  var perGroup = [];
   var titlesP = tmdbTitles(tmdbId, type).catch(function () { return null; });
   return loadContext(diag).then(function (ctx) {
     if (!ctx.groups.length) return;
-    return Promise.all(ctx.groups.map(function (group, gi) {
+    var work = Promise.all(ctx.groups.map(function (group, gi) {
       var gd = { n: gi + 1, hosts: group.members.map(function (m) { return m.host; }), result: "" };
+      var mine = perGroup[gi] = [];
       groupsDiag.push(gd);
       var t0 = now();
       return lookup(group, isMovie, tmdbId, titlesP, gd).then(function (found) {
         if (!found.refs.length) { gd.result = "no está en este panel"; return; }
-        gd.result = "encontrada por " + found.by + " (" + found.refs.length + ")";
         if (isMovie) {
           found.refs.forEach(function (ref) {
             var parts = ref.split("."), id = parts[0], ext = parts[1] || "mp4";
-            group.members.forEach(function (srv) { cards.push(card(srv, "/movie/" + srv.user + "/" + srv.pass + "/" + id + "." + ext, ext)); });
+            group.members.forEach(function (srv) { mine.push({ srv: srv, path: "/movie/" + srv.user + "/" + srv.pass + "/" + id + "." + ext, ext: ext, q: found.q[ref] || "" }); });
           });
+          gd.result = "encontrada por " + found.by + " (" + found.refs.length + ")";
           return;
         }
-        return findEpisode(group, found.refs[0], season || 1, episode || 1, gd).then(function (ep) {
-          if (!ep) { gd.result += "; episodio no encontrado"; return; }
-          group.members.forEach(function (srv) { cards.push(card(srv, "/series/" + srv.user + "/" + srv.pass + "/" + ep.id + "." + ep.ext, ep.ext)); });
+        return Promise.all(found.refs.slice(0, 3).map(function (ref) {
+          return findEpisode(group, ref, season || 1, episode || 1, gd).then(function (ep) {
+            if (!ep) return;
+            group.members.forEach(function (srv) { mine.push({ srv: srv, path: "/series/" + srv.user + "/" + srv.pass + "/" + ep.id + "." + ep.ext, ext: ep.ext, q: found.q[ref] || "" }); });
+          });
+        })).then(function () {
+          gd.result = "encontrada por " + found.by + " (" + found.refs.length + ")" + (mine.length ? "" : "; episodio no encontrado");
         });
       }).catch(function (e) { gd.result = "error: " + errText(e); }).then(function () { gd.ms = now() - t0; });
     }));
+    var timer;
+    var cap = new Promise(function (resolve) { timer = setTimeout(resolve, OVERALL_MS); });
+    return Promise.race([work, cap]).then(function () { clearTimeout(timer); });
   }).catch(function (e) {
     diag.fatal = errText(e);
   }).then(function () {
-    var result = cards;
+    var entries = [];
+    perGroup.forEach(function (list) { if (list) entries = entries.concat(list); });
+    var result = makeCards(entries);
     if (DEBUG) {
       var d = buildDiagCards(diag, groupsDiag);
       if (diag.fatal) d.unshift(diagCard("⚠ Error", [diag.fatal]));
-      result = cards.concat(d);
+      result = result.concat(d);
     }
     return result;
   }).catch(function () { return []; });
