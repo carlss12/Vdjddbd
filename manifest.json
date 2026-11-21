@@ -1,13 +1,13 @@
 {
   "name": "pelisjuani",
-  "version": "1.8",
+  "version": "2.0",
   "description": "Películas y series con varios servidores",
   "scrapers": [
     {
       "id": "toby",
       "name": "Toby",
       "description": "Películas y series con varios servidores",
-      "version": "1.8",
+      "version": "2.0",
       "author": "",
       "supportedTypes": ["movie", "tv"],
       "filename": "providers/pelisjuanita.js",
