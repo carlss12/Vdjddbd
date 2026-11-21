@@ -2,10 +2,13 @@
  * pelisjuanita.js - plugin de TV en vivo (VERSION DE DIAGNOSTICO)
  *
  * Flujo:
- *   tmdbId "cbl-<slug>" (ej. cbl-hbo-2)
+ *   tmdbId "cbl-<slug>" (llega como "kitsu:cbl-hbo-2")
  *   -> https://pelisjuanita.com/tv/<slug>  (lee el onclick del canal con su lista de servidores)
  *   -> pide cada servidor con Referer de pelisjuanita
  *   -> devuelve tarjetas "DIAGNOSTICO" con lo que respondio cada uno (aun no reproduce nada)
+ *
+ * MODO PRUEBA (TEST_SLUG): cuando el canal pedido es TEST_SLUG (hbo-2), ademas se prueban
+ * sitios fijos de otros canales que no estan en el addon (golden.php de DSports y Xtrema Cartoons).
  *
  * Tipos de servidor vistos en la pagina (todavia sin extractor):
  *   f.html?get=<base64|url>   HLS (a veces con proxy full-online.xyz)
@@ -21,13 +24,39 @@ if (typeof globalThis.setTimeout !== "function") {
 
 var LABEL = "Lat 3";
 var PREFIX = "cbl-";
-var VERSION = "pj-diag-1";
+var VERSION = "pj-diag-2";
 var BASE = "https://pelisjuanita.com/tv/";
 var REFERER = "https://pelisjuanita.com/tv/";
 var MAX_SERVERS = 6;
 var MAX_DUMP = 60000;
+var TEST_SLUG = "hbo-2";
 
 var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36";
+var UA_DESKTOP = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+
+var XTREMA_M3U8 = "https://stmv6.voxtvhd.com.br/xtremacartoons/xtremacartoons/playlist.m3u8";
+var XTREMA_B64 = "aHR0cHM6Ly9zdG12Ni52b3h0dmhkLmNvbS5ici94dHJlbWFjYXJ0b29ucy94dHJlbWFjYXJ0b29ucy9wbGF5bGlzdC5tM3U4";
+
+// Juegos de cabeceras para pedir la pagina del canal (para averiguar por que da 403)
+var PAGE_ATTEMPTS = [
+  { name: "A: Referer inicio.php, UA movil", h: { "Referer": "https://pelisjuanita.com/inicio.php" } },
+  { name: "B: sin Referer, UA movil", h: {} },
+  { name: "C: cabeceras de navegacion completas", h: {
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Upgrade-Insecure-Requests": "1", "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": "same-origin", "Referer": "https://pelisjuanita.com/inicio.php" } },
+  { name: "D: UA de escritorio, sin Referer", h: { "User-Agent": UA_DESKTOP } }
+];
+
+// Pruebas fijas (solo con TEST_SLUG)
+var FIXED_PROBES = [
+  { name: "m3u.php HBO2 HD (Referer tv/)", url: BASE + "servers/m3u.php?id=HBO2%20HD", h: { "Referer": REFERER, "Sec-Fetch-Dest": "iframe" } },
+  { name: "m3u.php HBO2 HD (sin Referer)", url: BASE + "servers/m3u.php?id=HBO2%20HD", h: {} },
+  { name: "golden.php dsportsco (Referer tv/)", url: BASE + "servers/golden.php?id=dsportsco", h: { "Referer": REFERER, "Sec-Fetch-Dest": "iframe" } },
+  { name: "Xtrema f.html?get=<base64> (Referer tv/)", url: BASE + "f.html?get=" + XTREMA_B64, h: { "Referer": REFERER, "Sec-Fetch-Dest": "iframe" } },
+  { name: "Xtrema m3u8 directo (Referer pelisjuanita)", url: XTREMA_M3U8, h: { "Referer": "https://pelisjuanita.com/", "Origin": "https://pelisjuanita.com" } },
+  { name: "Xtrema m3u8 directo (sin Referer)", url: XTREMA_M3U8, h: {} }
+];
 
 function slugFromId(id) {
   var t = String(id || "").toLowerCase(), i = t.indexOf(PREFIX);
@@ -67,12 +96,23 @@ function withTimeout(p, ms, label) {
   });
 }
 
+function hdrInfo(r) {
+  var o = "";
+  try {
+    ["content-type", "server", "location", "cf-ray", "cf-mitigated", "set-cookie"].forEach(function (k) {
+      var v = r.headers && r.headers.get && r.headers.get(k);
+      if (v) o += "  " + k + ": " + v + "\n";
+    });
+  } catch (e) {}
+  return o;
+}
+
 async function get(url, headers, ms) {
   var h = { "User-Agent": UA, "Accept-Language": "es-419,es;q=0.9" };
   for (var k in headers) h[k] = headers[k];
   var r = await withTimeout(fetch(url, { headers: h }), ms, "peticion");
   var text = await r.text();
-  return { status: r.status, ok: r.ok, finalUrl: r.url || "", text: text };
+  return { status: r.status, ok: r.ok, finalUrl: r.url || "", text: text, hdr: hdrInfo(r) };
 }
 
 function dump(text) {
@@ -91,18 +131,45 @@ function card(title, body) {
   };
 }
 
-async function probeServer(srv, idx) {
-  var url = resolveUrl(srv && srv.url);
-  if (!url) return card("SERVIDOR " + (idx + 1), "URL vacia en la lista.");
-  var head = "VERSION: " + VERSION + "\nSERVIDOR " + (idx + 1) + "\nURL pedida: " + url + "\nReferer enviado: " + REFERER + "\n";
+async function probe(label, url, headers) {
+  var head = "VERSION: " + VERSION + "\n" + label + "\nURL pedida: " + url + "\n";
   try {
-    var r = await get(url, { "Referer": REFERER, "Sec-Fetch-Dest": "iframe" }, 9000);
-    return card("SERVIDOR " + (idx + 1),
+    var r = await get(url, headers, 9000);
+    return card(label,
       head + "HTTP: " + r.status + "\nURL final: " + r.finalUrl + "\nLargo: " + r.text.length +
-      "\n\n----- RESPUESTA -----\n" + dump(r.text));
+      "\nCabeceras:\n" + (r.hdr || "  (ninguna legible)\n") +
+      "\n----- RESPUESTA -----\n" + dump(r.text));
   } catch (e) {
-    return card("SERVIDOR " + (idx + 1), head + "FALLO: " + (e && e.message ? e.message : e));
+    return card(label, head + "FALLO: " + (e && e.message ? e.message : e));
   }
+}
+
+// Pide la pagina del canal con cada juego de cabeceras. Devuelve texto resumen y el HTML si alguno dio 200.
+async function pageAttempts(pageUrl, slug) {
+  var lines = "Pagina: " + pageUrl + "\n\nIntentos:\n";
+  var results = await Promise.all(PAGE_ATTEMPTS.map(function (a) {
+    return get(pageUrl, a.h, 9000).then(function (r) { return { a: a, r: r }; },
+      function (e) { return { a: a, err: (e && e.message ? e.message : String(e)) }; });
+  }));
+  var html = "", servers = null, winner = "";
+  results.forEach(function (x) {
+    if (x.err) { lines += "- " + x.a.name + " -> FALLO: " + x.err + "\n"; return; }
+    lines += "- " + x.a.name + " -> HTTP " + x.r.status + ", largo " + x.r.text.length + "\n" + x.r.hdr;
+    if (!servers && x.r.status === 200 && x.r.text.length > 0) {
+      var s = parseServers(x.r.text, slug);
+      if (s) { servers = s; winner = x.a.name; }
+      if (!html) html = x.r.text;
+    }
+  });
+  if (servers) {
+    lines += "\nFuncionó el intento " + winner + ". Servidores del canal: " + servers.length + "\n";
+    servers.forEach(function (s, i) { lines += (i + 1) + ") " + resolveUrl(s && s.url) + "\n"; });
+  } else if (html) {
+    lines += "\nHubo HTML pero NO encontre el canal (data-slug) ni su onclick.\n\n----- INICIO DEL HTML -----\n" + dump(html);
+  } else {
+    lines += "\nNingun intento dio HTML con contenido.\n";
+  }
+  return { text: lines, servers: servers };
 }
 
 async function getStreams(tmdbId, type, season, episode) {
@@ -110,32 +177,32 @@ async function getStreams(tmdbId, type, season, episode) {
   var slug = slugFromId(tmdbId);
   if (!slug) return [];
 
-  var out = [];
   var pageUrl = BASE + encodeURIComponent(slug);
-  var servers = null;
-  var summary = "VERSION: " + VERSION + "\ntmdbId: " + tmdbId + "\nslug: " + slug + "\nPagina: " + pageUrl + "\n";
+  var testMode = slug === TEST_SLUG;
 
+  var fixedJobs = testMode ? FIXED_PROBES.map(function (p) { return probe("PRUEBA " + p.name, p.url, p.h); }) : [];
+  var pageRes;
   try {
-    var r = await get(pageUrl, { "Referer": "https://pelisjuanita.com/inicio.php" }, 9000);
-    summary += "HTTP: " + r.status + "\nURL final: " + r.finalUrl + "\nLargo HTML: " + r.text.length + "\n";
-    servers = parseServers(r.text, slug);
-    if (servers) {
-      summary += "Servidores en la lista: " + servers.length + "\n\n";
-      servers.forEach(function (s, i) { summary += (i + 1) + ") " + resolveUrl(s && s.url) + "\n"; });
-    } else {
-      summary += "\nNO encontre el canal (data-slug) ni su onclick en el HTML.\n\n----- INICIO DEL HTML -----\n" + dump(r.text);
-    }
+    pageRes = await pageAttempts(pageUrl, slug);
   } catch (e) {
-    summary += "FALLO al pedir la pagina: " + (e && e.message ? e.message : e);
+    pageRes = { text: "Pagina: " + pageUrl + "\nFALLO: " + (e && e.message ? e.message : e), servers: null };
   }
-  out.push(card("DIAGNOSTICO " + slug, summary));
 
-  if (servers && servers.length) {
-    var jobs = servers.slice(0, MAX_SERVERS).map(function (s, i) { return probeServer(s, i); });
-    var cards = await Promise.all(jobs);
-    out = out.concat(cards);
+  var out = [card("DIAGNOSTICO " + slug,
+    "VERSION: " + VERSION + "\ntmdbId: " + tmdbId + "\nslug: " + slug + "\nModo prueba: " + (testMode ? "si" : "no") + "\n\n" + pageRes.text)];
+
+  var seen = {};
+  FIXED_PROBES.forEach(function (p) { seen[p.url] = true; });
+  var srvJobs = [];
+  if (pageRes.servers) {
+    pageRes.servers.slice(0, MAX_SERVERS).forEach(function (s, i) {
+      var u = resolveUrl(s && s.url);
+      if (!u || (testMode && seen[u])) return;
+      srvJobs.push(probe("SERVIDOR " + (i + 1) + " del canal", u, { "Referer": REFERER, "Sec-Fetch-Dest": "iframe" }));
+    });
   }
-  return out;
+  var cards = await Promise.all(fixedJobs.concat(srvJobs));
+  return out.concat(cards);
 }
 
 exports.getStreams = getStreams;
