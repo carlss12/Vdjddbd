@@ -9,6 +9,7 @@
  *
  * MODO PRUEBA (TEST_SLUG): cuando el canal pedido es TEST_SLUG (hbo-2), ademas se prueban
  * sitios fijos de otros canales que no estan en el addon (golden.php de DSports y Xtrema Cartoons).
+ * Probado en pj-diag-2: el .m3u8 de Xtrema abre sin Referer (200, #EXTM3U); golden.php abre desde el plugin (200).
  *
  * Tipos de servidor vistos en la pagina (todavia sin extractor):
  *   f.html?get=<base64|url>   HLS (a veces con proxy full-online.xyz)
@@ -24,17 +25,19 @@ if (typeof globalThis.setTimeout !== "function") {
 
 var LABEL = "Lat 3";
 var PREFIX = "cbl-";
-var VERSION = "pj-diag-2";
+var VERSION = "pj-diag-3";
 var BASE = "https://pelisjuanita.com/tv/";
 var REFERER = "https://pelisjuanita.com/tv/";
 var MAX_SERVERS = 6;
-var MAX_DUMP = 60000;
+var SHORT_FULL = 3000;   // respuestas de hasta este largo se muestran completas
+var CTX = 200;           // caracteres alrededor de cada palabra clave
+var MAX_SNIPS = 14;      // maximo de fragmentos por respuesta
+var MAX_SNIP_LEN = 1500; // largo maximo de cada fragmento
 var TEST_SLUG = "hbo-2";
 
 var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36";
 var UA_DESKTOP = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
-var XTREMA_M3U8 = "https://stmv6.voxtvhd.com.br/xtremacartoons/xtremacartoons/playlist.m3u8";
 var XTREMA_B64 = "aHR0cHM6Ly9zdG12Ni52b3h0dmhkLmNvbS5ici94dHJlbWFjYXJ0b29ucy94dHJlbWFjYXJ0b29ucy9wbGF5bGlzdC5tM3U4";
 
 // Juegos de cabeceras para pedir la pagina del canal (para averiguar por que da 403)
@@ -53,9 +56,7 @@ var FIXED_PROBES = [
   { name: "m3u.php HBO2 HD (Referer tv/)", url: BASE + "servers/m3u.php?id=HBO2%20HD", h: { "Referer": REFERER, "Sec-Fetch-Dest": "iframe" } },
   { name: "m3u.php HBO2 HD (sin Referer)", url: BASE + "servers/m3u.php?id=HBO2%20HD", h: {} },
   { name: "golden.php dsportsco (Referer tv/)", url: BASE + "servers/golden.php?id=dsportsco", h: { "Referer": REFERER, "Sec-Fetch-Dest": "iframe" } },
-  { name: "Xtrema f.html?get=<base64> (Referer tv/)", url: BASE + "f.html?get=" + XTREMA_B64, h: { "Referer": REFERER, "Sec-Fetch-Dest": "iframe" } },
-  { name: "Xtrema m3u8 directo (Referer pelisjuanita)", url: XTREMA_M3U8, h: { "Referer": "https://pelisjuanita.com/", "Origin": "https://pelisjuanita.com" } },
-  { name: "Xtrema m3u8 directo (sin Referer)", url: XTREMA_M3U8, h: {} }
+  { name: "Xtrema f.html?get=<base64> (Referer tv/)", url: BASE + "f.html?get=" + XTREMA_B64, h: { "Referer": REFERER, "Sec-Fetch-Dest": "iframe" } }
 ];
 
 function slugFromId(id) {
@@ -115,10 +116,36 @@ async function get(url, headers, ms) {
   return { status: r.status, ok: r.ok, finalUrl: r.url || "", text: text, hdr: hdrInfo(r) };
 }
 
+var KEYS = "\\.m3u8|\\.mpd|\\.mp4|ck_key|keyid|playbackURL|<iframe|<source|\\bfile\\s*:|eval\\(|atob\\(|var\\s+url\\b|\"src\"\\s*:|hls\\d?\\s*[:=]";
+
+// Respuesta corta: completa. Respuesta larga: solo fragmentos alrededor de palabras clave.
 function dump(text) {
   text = String(text || "");
-  if (text.length <= MAX_DUMP) return text;
-  return text.slice(0, MAX_DUMP) + "\n[... cortado: el original mide " + text.length + " caracteres]";
+  if (text.length <= SHORT_FULL) return text;
+  var re = new RegExp(KEYS, "ig"), ranges = [], m, hits = 0, more = false;
+  while ((m = re.exec(text)) !== null) {
+    if (!m[0].length) { re.lastIndex++; continue; }
+    hits++;
+    var a = Math.max(0, m.index - CTX), b = Math.min(text.length, m.index + m[0].length + CTX);
+    var last = ranges[ranges.length - 1];
+    if (last && a <= last[1]) { last[1] = Math.max(last[1], b); }
+    else {
+      if (ranges.length >= MAX_SNIPS) { more = true; break; }
+      ranges.push([a, b]);
+    }
+  }
+  if (!ranges.length) {
+    return "[" + text.length + " caracteres, NINGUNA palabra clave encontrada]\n--- inicio ---\n" +
+      text.slice(0, 1500) + "\n--- final ---\n" + text.slice(-500);
+  }
+  var out = "[" + text.length + " caracteres; " + ranges.length + " fragmentos con palabras clave, " + hits + " coincidencias" +
+    (more ? "; HAY MAS no mostradas" : "") + "]\n";
+  ranges.forEach(function (r, i) {
+    var piece = text.slice(r[0], r[1]).replace(/\s+/g, " ");
+    if (piece.length > MAX_SNIP_LEN) piece = piece.slice(0, MAX_SNIP_LEN) + " [...]";
+    out += "\n--- fragmento " + (i + 1) + " (pos " + r[0] + ") ---\n" + piece + "\n";
+  });
+  return out;
 }
 
 function card(title, body) {
@@ -209,3 +236,4 @@ exports.getStreams = getStreams;
 exports._slugFromId = slugFromId;
 exports._parseServers = parseServers;
 exports._resolveUrl = resolveUrl;
+exports._dump = dump;
